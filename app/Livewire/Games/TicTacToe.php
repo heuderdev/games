@@ -76,6 +76,7 @@ class TicTacToe extends Component
 
         $this->roomId = $room->id;
         $this->loadRoom();
+        $this->redirect(route('games.tic-tac-toe', ['roomId' => $this->roomId]));
     }
 
     public function joinRoom(): void
@@ -165,6 +166,15 @@ class TicTacToe extends Component
             $this->service()->playMove($this->room, $user, $cell);
         } catch (ValidationException $e) {
             $this->setErrorFromException($e);
+            return;
+        }
+
+        $this->loadRoom();
+    }
+
+    public function refreshRoom(): void
+    {
+        if (! $this->roomId) {
             return;
         }
 
