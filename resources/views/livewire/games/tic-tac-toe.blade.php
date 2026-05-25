@@ -1,4 +1,4 @@
-<div class="max-w-3xl mx-auto p-6 space-y-6" wire:poll.3s="refreshRoom">
+<div class="max-w-3xl mx-auto p-6 space-y-6">
     <h1 class="text-2xl font-bold">Sala - Jogo da Velha</h1>
 
     @if ($errorMessage)
