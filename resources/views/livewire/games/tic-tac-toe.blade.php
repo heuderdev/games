@@ -1,4 +1,4 @@
-<div class="max-w-3xl mx-auto p-6 space-y-6" wire:poll.3s="refreshRoom">
+<div class="max-w-3xl mx-auto p-6 space-y-6">
     <h1 class="text-2xl font-bold">Sala - Jogo da Velha</h1>
 
     @if ($errorMessage)
@@ -15,42 +15,44 @@
 
     {{-- Criar sala --}}
     @if (!$room)
-    @if ($existingOpenRoom)
-    {{-- Usuário já tem uma sala aberta --}}
+    @if ($this->existingOpenRoom)
     <div class="p-4 border border-yellow-300 rounded bg-yellow-50 space-y-3">
         <div class="font-semibold text-yellow-800">
-            ⚠️ Você já possui uma sala aberta (Sala #{{ $existingOpenRoom->id }})
+            ⚠️ Você já possui uma sala aberta (Sala #{{ $this->existingOpenRoom->id }})
         </div>
+
         <div class="text-sm text-yellow-700">
-            Status: <strong>{{ $existingOpenRoom->status }}</strong> —
-            Aposta: <strong>R$ {{ number_format($existingOpenRoom->bet_amount, 2, ',', '.') }}</strong>
+            Status: <strong>{{ $this->existingOpenRoom->status }}</strong>
+            —
+            Aposta: <strong>R$ {{ number_format($this->existingOpenRoom->bet_amount, 2, ',', '.') }}</strong>
         </div>
+
         <div class="flex gap-3">
             <button type="button" wire:click="enterExistingRoom"
                 class="px-4 py-2 rounded bg-blue-600 text-white text-sm">
                 Entrar na minha sala
             </button>
 
-            @if ($existingOpenRoom->isWaiting())
-            <button type="button" wire:click="cancelRoom"
-                wire:confirm="Tem certeza que deseja cancelar esta sala? O valor apostado será estornado."
-                class="px-4 py-2 rounded bg-red-600 text-white text-sm">
+            @if ($this->existingOpenRoom->isWaiting())
+            <button type="button" wire:click="cancelRoom" class="px-4 py-2 rounded bg-red-600 text-white text-sm">
                 Cancelar sala
             </button>
             @endif
         </div>
     </div>
     @else
-    {{-- Nenhuma sala aberta, exibe formulário normalmente --}}
     <div class="p-4 border rounded space-y-3">
         <h2 class="font-semibold">Criar nova sala</h2>
+
         <div class="flex items-center gap-4">
             <input type="number" step="0.01" min="1" wire:model.live="betAmount" class="border rounded px-3 py-2 w-40"
-                placeholder="Aposta R$" />
+                placeholder="Aposta R$">
+
             <label class="inline-flex items-center gap-2 text-sm">
-                <input type="checkbox" wire:model.live="vsBot" class="rounded border-gray-300" />
+                <input type="checkbox" wire:model.live="vsBot" class="rounded border-gray-300">
                 Jogar contra bot
             </label>
+
             <button type="button" wire:click="createRoom" class="px-4 py-2 rounded bg-emerald-600 text-white">
                 Criar sala
             </button>
@@ -123,9 +125,7 @@
         @if ($room->isFinished())
         @if ($room->winner_id)
         <span class="font-semibold text-emerald-700">
-            Partida encerrada. Vencedor:
-            {{ optional($room->winner)->name ?? 'Jogador' }}
-            ({{ $winnerSymbol ?? '?' }})
+            Partida encerrada. Vencedor: {{ optional($room->winner)->name ?? 'Jogador ' . ($winnerSymbol ?? '?') }}
         </span>
         @else
         <span class="font-semibold text-gray-700">
@@ -140,6 +140,10 @@
         @elseif ($isDraw)
         <span class="font-semibold text-gray-700">
             Empate! Aguardando fechamento da sala...
+        </span>
+        @elseif ($this->turnMessage)
+        <span class="font-semibold {{ $this->canPlay ? 'text-blue-700' : 'text-amber-700' }}">
+            {{ $this->turnMessage }}
         </span>
         @else
         <span>

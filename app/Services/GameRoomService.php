@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Events\GameRoomUpdated;
 use App\Models\BotDifficultyRule;
 use App\Models\GameRoom;
 use App\Models\GameRoomMove;
@@ -20,12 +21,19 @@ class GameRoomService
     public function __construct(
         protected DatabaseManager $db,
         protected MinimaxBotService $bot,
-        protected BotDecisionService $botDecision, // novo
+        protected BotDecisionService $botDecision,
     ) {}
 
     protected function botUserId(): int
     {
         return User::query()->where('email', 'bot@game.local')->value('id');
+    }
+
+    protected function dispatchRoomUpdatedAfterCommit(int $roomId): void
+    {
+        DB::afterCommit(function () use ($roomId) {
+            GameRoomUpdated::dispatch($roomId);
+        });
     }
 
     public function assertUserHasNoOpenRoom(User $user): void
@@ -88,7 +96,6 @@ class GameRoomService
                 'joined_at'    => Carbon::now(),
             ]);
 
-            // debita da carteira_game (saldo jogável)
             $creator->decrement('carteira_game', $betAmount);
 
             GameRoomTransaction::create([
@@ -98,6 +105,8 @@ class GameRoomService
                 'amount'       => $betAmount,
                 'reference'    => 'room:' . $room->id,
             ]);
+
+            $this->dispatchRoomUpdatedAfterCommit($room->id);
 
             return $room;
         });
@@ -112,18 +121,15 @@ class GameRoomService
 
         $platformFeePercent ??= config('game.platform_fee_percent');
 
-        // verifica saldo do criador
         if (! $creator->hasGameBalance($betAmount)) {
             throw ValidationException::withMessages([
                 'credit' => 'Créditos insuficientes para criar a sala.',
             ]);
         }
 
-        // carrega o usuário BOT
         $botUserId = $this->botUserId();
-        $bot       = User::findOrFail($botUserId);
+        $bot = User::findOrFail($botUserId);
 
-        // verifica saldo do BOT
         if (! $bot->hasGameBalance($betAmount)) {
             throw ValidationException::withMessages([
                 'bot' => 'Plataforma sem saldo suficiente para jogar. Não se preocupe, o administrador vai ser notificado, para fazer a recarga.',
@@ -131,7 +137,6 @@ class GameRoomService
         }
 
         return $this->db->transaction(function () use ($creator, $bot, $betAmount, $platformFeePercent) {
-            // sorteia quem será X (e portanto quem começa)
             $botSymbol = random_int(0, 1) === 1 ? 'X' : 'O';
 
             $room = GameRoom::create([
@@ -142,7 +147,6 @@ class GameRoomService
                 'mode'                 => 'human_vs_bot',
             ]);
 
-            // humano
             GameRoomParticipant::create([
                 'game_room_id' => $room->id,
                 'user_id'      => $creator->id,
@@ -151,7 +155,6 @@ class GameRoomService
                 'joined_at'    => Carbon::now(),
             ]);
 
-            // bot
             GameRoomParticipant::create([
                 'game_room_id' => $room->id,
                 'user_id'      => $bot->id,
@@ -160,7 +163,6 @@ class GameRoomService
                 'joined_at'    => Carbon::now(),
             ]);
 
-            // debita criador
             $creator->decrement('carteira_game', $betAmount);
 
             GameRoomTransaction::create([
@@ -171,7 +173,6 @@ class GameRoomService
                 'reference'    => 'room:' . $room->id,
             ]);
 
-            // debita BOT
             $bot->decrement('carteira_game', $betAmount);
 
             GameRoomTransaction::create([
@@ -182,11 +183,12 @@ class GameRoomService
                 'reference'    => 'room:' . $room->id,
             ]);
 
-            // se o bot for X, ele deve fazer a primeira jogada
             if ($botSymbol === 'X') {
                 $this->playBotMove($room);
                 $room->refresh();
             }
+
+            $this->dispatchRoomUpdatedAfterCommit($room->id);
 
             return $room;
         });
@@ -227,7 +229,23 @@ class GameRoomService
         }
 
         return $this->db->transaction(function () use ($room, $user) {
-            $players = $room->players()->lockForUpdate()->get();
+            $lockedRoom = GameRoom::query()
+                ->lockForUpdate()
+                ->findOrFail($room->id);
+
+            if (! $lockedRoom->isWaiting()) {
+                throw ValidationException::withMessages([
+                    'room' => 'Sala não está mais disponível para jogadores.',
+                ]);
+            }
+
+            if ($lockedRoom->participants()->where('user_id', $user->id)->exists()) {
+                throw ValidationException::withMessages([
+                    'room' => 'Você já está nessa sala.',
+                ]);
+            }
+
+            $players = $lockedRoom->players()->lockForUpdate()->get();
 
             if ($players->count() >= 2) {
                 throw ValidationException::withMessages([
@@ -246,29 +264,31 @@ class GameRoomService
             $symbol = $creatorPlayer->symbol === 'X' ? 'O' : 'X';
 
             $participant = GameRoomParticipant::create([
-                'game_room_id' => $room->id,
+                'game_room_id' => $lockedRoom->id,
                 'user_id'      => $user->id,
                 'role'         => 'player',
                 'symbol'       => $symbol,
                 'joined_at'    => Carbon::now(),
             ]);
 
-            $user->decrement('carteira_game', $room->bet_amount);
+            $user->decrement('carteira_game', $lockedRoom->bet_amount);
 
             GameRoomTransaction::create([
-                'game_room_id' => $room->id,
+                'game_room_id' => $lockedRoom->id,
                 'user_id'      => $user->id,
                 'type'         => 'entry_bet',
-                'amount'       => $room->bet_amount,
-                'reference'    => 'room:' . $room->id,
+                'amount'       => $lockedRoom->bet_amount,
+                'reference'    => 'room:' . $lockedRoom->id,
             ]);
 
             if ($players->count() + 1 === 2) {
-                $room->update([
+                $lockedRoom->update([
                     'status'     => 'active',
                     'started_at' => Carbon::now(),
                 ]);
             }
+
+            $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
 
             return $participant;
         });
@@ -280,13 +300,17 @@ class GameRoomService
             return $room->participants()->where('user_id', $user->id)->first();
         }
 
-        return GameRoomParticipant::create([
+        $participant = GameRoomParticipant::create([
             'game_room_id' => $room->id,
             'user_id'      => $user->id,
             'role'         => 'spectator',
             'symbol'       => null,
             'joined_at'    => Carbon::now(),
         ]);
+
+        $this->dispatchRoomUpdatedAfterCommit($room->id);
+
+        return $participant;
     }
 
     public function playMove(GameRoom $room, User $user, int $cell): GameRoomMove
@@ -315,53 +339,78 @@ class GameRoomService
         }
 
         return $this->db->transaction(function () use ($room, $user, $participant, $cell) {
-            $lastMove = $room->moves()->orderByDesc('turn_number')->lockForUpdate()->first();
+            $lockedRoom = GameRoom::query()
+                ->lockForUpdate()
+                ->findOrFail($room->id);
+
+            if (! $lockedRoom->isActive()) {
+                throw ValidationException::withMessages([
+                    'room' => 'Sala não está ativa.',
+                ]);
+            }
+
+            $lockedParticipant = $lockedRoom->participants()
+                ->where('user_id', $user->id)
+                ->where('role', 'player')
+                ->first();
+
+            if (! $lockedParticipant) {
+                throw ValidationException::withMessages([
+                    'user' => 'Você não é um jogador desta sala.',
+                ]);
+            }
+
+            $lastMove = $lockedRoom->moves()->orderByDesc('turn_number')->lockForUpdate()->first();
             $nextTurn = $lastMove ? $lastMove->turn_number + 1 : 1;
 
             $expectedSymbol = $nextTurn % 2 === 1 ? 'X' : 'O';
 
-            if ($participant->symbol !== $expectedSymbol) {
+            if ($lockedParticipant->symbol !== $expectedSymbol) {
                 throw ValidationException::withMessages([
                     'turn' => 'Não é a sua vez.',
                 ]);
             }
 
-            if ($room->moves()->where('cell', $cell)->exists()) {
+            if ($lockedRoom->moves()->where('cell', $cell)->exists()) {
                 throw ValidationException::withMessages([
                     'cell' => 'Casa já ocupada.',
                 ]);
             }
 
             $move = GameRoomMove::create([
-                'game_room_id' => $room->id,
+                'game_room_id' => $lockedRoom->id,
                 'user_id'      => $user->id,
                 'cell'         => $cell,
                 'turn_number'  => $nextTurn,
             ]);
 
-            $board        = $this->buildBoard($room);
+            $board = $this->buildBoard($lockedRoom);
             $winnerSymbol = $this->checkWinner($board);
 
             if ($winnerSymbol !== null) {
-                $winnerParticipant = $room->participants()
+                $winnerParticipant = $lockedRoom->participants()
                     ->where('role', 'player')
                     ->where('symbol', $winnerSymbol)
                     ->first();
 
-                $this->finishRoom($room, $winnerParticipant?->user);
+                $this->finishRoom($lockedRoom, $winnerParticipant?->user);
+                $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
 
                 return $move;
             }
 
             if ($this->isBoardFull($board)) {
-                $this->finishRoom($room, null);
+                $this->finishRoom($lockedRoom, null);
+                $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
 
                 return $move;
             }
 
-            if ($room->mode === 'human_vs_bot') {
-                $this->playBotMove($room);
+            if ($lockedRoom->mode === 'human_vs_bot') {
+                $this->playBotMove($lockedRoom);
             }
+
+            $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
 
             return $move;
         });
@@ -372,48 +421,36 @@ class GameRoomService
         $botId = $this->botUserId();
 
         $todayStart = Carbon::today();
-        $todayEnd   = Carbon::today()->endOfDay();
+        $todayEnd = Carbon::today()->endOfDay();
 
-        // soma dos payouts do bot no dia
         $botWinnerPayoutToday = GameRoomTransaction::query()
             ->where('user_id', $botId)
             ->where('type', 'winner_payout')
             ->whereBetween('created_at', [$todayStart, $todayEnd])
             ->sum('amount');
 
-        $target       = (float) config('game.bot_daily_target', 1000);     // meta de caixa diária
-        $targetRatio  = (float) config('game.bot_target_ratio', 0.6);      // 60%
+        $target = (float) config('game.bot_daily_target', 1000);
+        $targetRatio = (float) config('game.bot_target_ratio', 0.6);
         $targetAmount = $target * $targetRatio;
 
-        // evita divisão por zero
         if ($targetAmount <= 0) {
-            // fallback simples: usa medium
             return 'medium';
         }
 
-        // porcentagem do target atingida
-        $progress = $botWinnerPayoutToday / $targetAmount; // ex.: 0.5 => 50% do target
+        $progress = $botWinnerPayoutToday / $targetAmount;
 
-        /**
-         * Estratégia:
-         * - progress < 0.3  => bot está "pobre" -> hard/hardcore pra recuperar
-         * - 0.3 <= p < 0.7  => medium / hard
-         * - 0.7 <= p < 1.0  => easy
-         * - p >= 1.0        => idiot (bem burro pra devolver)
-         */
         if ($progress < 0.3) {
-            return 'hardcore'; // casa muito abaixo da meta, bot joga sério
+            return 'hardcore';
         }
 
         if ($progress < 0.7) {
-            return 'hard'; // chegando na meta, mas ainda abaixo
+            return 'hard';
         }
 
         if ($progress < 1.0) {
-            return 'medium'; // perto da meta, neutraliza
+            return 'medium';
         }
 
-        // acima da meta (bot já bateu target) -> deixa burro
         return 'idiot';
     }
 
@@ -423,7 +460,7 @@ class GameRoomService
 
         $time = $now->format('H:i:s');
         $todayDate = $now->toDateString();
-        $weekday   = (int) $now->dayOfWeek;
+        $weekday = (int) $now->dayOfWeek;
 
         $query = BotDifficultyRule::query()
             ->where('active', true)
@@ -447,10 +484,8 @@ class GameRoomService
             return $rule->difficulty;
         }
 
-        // 2) se não existir regra manual, usa regra dinâmica baseada no caixa diário
         return $this->determineBotDifficultyForToday();
     }
-
 
     protected function playBotMove(GameRoom $room): void
     {
@@ -465,7 +500,7 @@ class GameRoomService
         }
 
         $botSymbol = $botParticipant->symbol;
-        $board     = $this->buildBoard($room);
+        $board = $this->buildBoard($room);
 
         $winnerSymbol = $this->checkWinner($board);
 
@@ -473,7 +508,6 @@ class GameRoomService
             return;
         }
 
-        // movimento perfeito via Minimax
         $perfectMove = $this->bot->bestMove($board, $botSymbol);
 
         if ($perfectMove === null) {
@@ -483,11 +517,11 @@ class GameRoomService
         $difficulty = $this->resolveBotDifficulty();
 
         $allowedDifficulties = ['idiot', 'easy', 'medium', 'hard', 'hardcore'];
+
         if (! in_array($difficulty, $allowedDifficulties, true)) {
             $difficulty = 'easy';
         }
 
-        // delega para o BotDecisionService escolher o movimento final
         $bestMove = $this->botDecision->pickMoveWithDifficulty(
             $board,
             $botSymbol,
@@ -575,86 +609,87 @@ class GameRoomService
     public function finishRoom(GameRoom $room, ?User $winner): void
     {
         $this->db->transaction(function () use ($room, $winner) {
-            if ($room->isFinished()) {
+            $lockedRoom = GameRoom::query()
+                ->lockForUpdate()
+                ->findOrFail($room->id);
+
+            if ($lockedRoom->isFinished()) {
                 return;
             }
 
-            // pega jogadores envolvidos
-            $players = $room->players()->with('user')->lockForUpdate()->get();
+            $players = $lockedRoom->players()->with('user')->lockForUpdate()->get();
 
             if ($players->count() !== 2) {
-                // segurança: não faz nada se não tiver 2 players
-                $room->update([
+                $lockedRoom->update([
                     'status'      => 'finished',
                     'winner_id'   => null,
                     'finished_at' => Carbon::now(),
                 ]);
 
+                $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
+
                 return;
             }
 
-            $betAmount = $room->bet_amount;
+            $betAmount = $lockedRoom->bet_amount;
 
             if ($winner) {
-                // -------------------------------
-                // CENÁRIO: TEM VENCEDOR
-                // -------------------------------
-                $totalPot     = $betAmount * 2;
-                $platformFee  = round($totalPot * ($room->platform_fee_percent / 100), 2);
+                $freshWinner = User::query()
+                    ->lockForUpdate()
+                    ->findOrFail($winner->id);
+
+                $totalPot = $betAmount * 2;
+                $platformFee = round($totalPot * ($lockedRoom->platform_fee_percent / 100), 2);
                 $winnerPayout = $totalPot - $platformFee;
 
-                // credita saldo na carteira_game e acumula ganhos
-                // $winner->increment('carteira_game', $winnerPayout);
-                $winner->increment('winnings_balance', $winnerPayout);
+                $freshWinner->increment('winnings_balance', $winnerPayout);
 
-                // registra pagamento do vencedor
                 GameRoomTransaction::create([
-                    'game_room_id' => $room->id,
-                    'user_id'      => $winner->id,
+                    'game_room_id' => $lockedRoom->id,
+                    'user_id'      => $freshWinner->id,
                     'type'         => 'winner_payout',
                     'amount'       => $winnerPayout,
-                    'reference'    => 'room:' . $room->id,
+                    'reference'    => 'room:' . $lockedRoom->id,
                 ]);
 
-                // registra taxa da plataforma
                 GameRoomTransaction::create([
-                    'game_room_id' => $room->id,
-                    'user_id'      => null, // ou id da conta da plataforma
+                    'game_room_id' => $lockedRoom->id,
+                    'user_id'      => null,
                     'type'         => 'platform_fee',
                     'amount'       => $platformFee,
-                    'reference'    => 'room:' . $room->id,
+                    'reference'    => 'room:' . $lockedRoom->id,
                 ]);
             } else {
-                // -------------------------------
-                // CENÁRIO: EMPATE
-                // -------------------------------
                 foreach ($players as $participant) {
-                    $user = $participant->user;
+                    $playerUser = $participant->user;
 
-                    if (! $user) {
+                    if (! $playerUser) {
                         continue;
                     }
 
-                    // devolve exatamente o bet_amount na carteira_game
-                    $user->increment('carteira_game', $betAmount);
+                    $freshUser = User::query()
+                        ->lockForUpdate()
+                        ->findOrFail($playerUser->id);
+
+                    $freshUser->increment('carteira_game', $betAmount);
 
                     GameRoomTransaction::create([
-                        'game_room_id' => $room->id,
-                        'user_id'      => $user->id,
+                        'game_room_id' => $lockedRoom->id,
+                        'user_id'      => $freshUser->id,
                         'type'         => 'draw_refund',
                         'amount'       => $betAmount,
-                        'reference'    => 'room:' . $room->id,
+                        'reference'    => 'room:' . $lockedRoom->id,
                     ]);
                 }
-
-                // sem platform_fee em empate
             }
 
-            $room->update([
+            $lockedRoom->update([
                 'status'      => 'finished',
                 'winner_id'   => $winner?->id,
                 'finished_at' => Carbon::now(),
             ]);
+
+            $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
         });
     }
 
@@ -667,28 +702,30 @@ class GameRoomService
         }
 
         DB::transaction(function () use ($room, $user) {
-            $room = GameRoom::query()
+            $lockedRoom = GameRoom::query()
                 ->lockForUpdate()
                 ->findOrFail($room->id);
 
-            if (! $room->isWaiting()) {
+            if (! $lockedRoom->isWaiting()) {
                 throw ValidationException::withMessages([
                     'room' => ['Esta sala não pode mais ser cancelada.'],
                 ]);
             }
 
-            if ($room->bet_amount > 0) {
-                $freshUser = \App\Models\User::query()
+            if ($lockedRoom->bet_amount > 0) {
+                $freshUser = User::query()
                     ->lockForUpdate()
                     ->findOrFail($user->id);
 
-                $freshUser->increment('carteira_game', $room->bet_amount);
+                $freshUser->increment('carteira_game', $lockedRoom->bet_amount);
             }
 
-            $room->update([
+            $lockedRoom->update([
                 'status'      => 'finished',
                 'finished_at' => now(),
             ]);
+
+            $this->dispatchRoomUpdatedAfterCommit($lockedRoom->id);
         });
     }
 }

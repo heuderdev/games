@@ -2,35 +2,33 @@
 
 namespace App\Events;
 
+use App\Models\GameRoom;
 use Illuminate\Broadcasting\Channel;
 use Illuminate\Broadcasting\InteractsWithSockets;
-use Illuminate\Broadcasting\PresenceChannel;
-use Illuminate\Broadcasting\PrivateChannel;
-use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
-class GameRoomUpdated
+class GameRoomUpdated implements ShouldBroadcastNow
 {
-    use Dispatchable, InteractsWithSockets, SerializesModels;
+    use Dispatchable;
+    use InteractsWithSockets;
+    use SerializesModels;
 
-    /**
-     * Create a new event instance.
-     */
-    public function __construct()
-    {
-        //
-    }
+    public function __construct(
+        public int $roomId,
+    ) {}
 
-    /**
-     * Get the channels the event should broadcast on.
-     *
-     * @return array<int, Channel>
-     */
     public function broadcastOn(): array
     {
         return [
-            new PrivateChannel('channel-name'),
+            new Channel("game-room.{$this->roomId}"),
+            new Channel('game-lobby'),
         ];
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'room.updated';
     }
 }
