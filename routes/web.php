@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\GameRoomController;
 use App\Http\Controllers\ProfileController;
 use Illuminate\Support\Facades\Route;
 
@@ -18,4 +19,8 @@ Route::middleware('auth')->group(function () {
 
 require __DIR__ . '/auth.php';
 
-Route::middleware('auth')->get('/jogos/jogo-da-velha', [App\Http\Controllers\GameRoomController::class, 'index'])->name('games.tic-tac-toe');
+Route::middleware('auth')->get('/jogos/jogo-da-velha', [GameRoomController::class, 'index'])->name('games.tic-tac-toe');
+
+Route::delete('/jogos/sala/{room}/cancelar', [GameRoomController::class, 'cancel'])
+    ->middleware('auth')
+    ->name('games.room.cancel');

@@ -8,8 +8,10 @@ use App\Models\GameRoomMove;
 use App\Models\GameRoomParticipant;
 use App\Models\GameRoomTransaction;
 use App\Models\User;
+use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Database\DatabaseManager;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 
@@ -104,8 +106,7 @@ class GameRoomService
     public function createRoomAgainstBot(
         User $creator,
         float $betAmount,
-        float $platformFeePercent = null,
-        string $botSymbol = 'O'
+        float $platformFeePercent = null
     ): GameRoom {
         $this->assertUserHasNoOpenRoom($creator);
 
@@ -129,7 +130,10 @@ class GameRoomService
             ]);
         }
 
-        return $this->db->transaction(function () use ($creator, $bot, $betAmount, $platformFeePercent, $botSymbol) {
+        return $this->db->transaction(function () use ($creator, $bot, $betAmount, $platformFeePercent) {
+            // sorteia quem será X (e portanto quem começa)
+            $botSymbol = random_int(0, 1) === 1 ? 'X' : 'O';
+
             $room = GameRoom::create([
                 'creator_id'           => $creator->id,
                 'bet_amount'           => $betAmount,
@@ -152,7 +156,7 @@ class GameRoomService
                 'game_room_id' => $room->id,
                 'user_id'      => $bot->id,
                 'role'         => 'player',
-                'symbol'       => strtoupper($botSymbol),
+                'symbol'       => $botSymbol,
                 'joined_at'    => Carbon::now(),
             ]);
 
@@ -177,6 +181,12 @@ class GameRoomService
                 'amount'       => $betAmount,
                 'reference'    => 'room:' . $room->id,
             ]);
+
+            // se o bot for X, ele deve fazer a primeira jogada
+            if ($botSymbol === 'X') {
+                $this->playBotMove($room);
+                $room->refresh();
+            }
 
             return $room;
         });
@@ -217,15 +227,23 @@ class GameRoomService
         }
 
         return $this->db->transaction(function () use ($room, $user) {
-            $playersCount = $room->players()->lockForUpdate()->count();
+            $players = $room->players()->lockForUpdate()->get();
 
-            if ($playersCount >= 2) {
+            if ($players->count() >= 2) {
                 throw ValidationException::withMessages([
                     'room' => 'Sala já possui dois jogadores.',
                 ]);
             }
 
-            $symbol = $playersCount === 0 ? 'X' : 'O';
+            $creatorPlayer = $players->first();
+
+            if (! $creatorPlayer || ! in_array($creatorPlayer->symbol, ['X', 'O'], true)) {
+                throw ValidationException::withMessages([
+                    'room' => 'Sala inválida para entrada.',
+                ]);
+            }
+
+            $symbol = $creatorPlayer->symbol === 'X' ? 'O' : 'X';
 
             $participant = GameRoomParticipant::create([
                 'game_room_id' => $room->id,
@@ -235,7 +253,6 @@ class GameRoomService
                 'joined_at'    => Carbon::now(),
             ]);
 
-            // debita da carteira_game
             $user->decrement('carteira_game', $room->bet_amount);
 
             GameRoomTransaction::create([
@@ -246,7 +263,7 @@ class GameRoomService
                 'reference'    => 'room:' . $room->id,
             ]);
 
-            if ($room->players()->count() === 2) {
+            if ($players->count() + 1 === 2) {
                 $room->update([
                     'status'     => 'active',
                     'started_at' => Carbon::now(),
@@ -637,6 +654,40 @@ class GameRoomService
                 'status'      => 'finished',
                 'winner_id'   => $winner?->id,
                 'finished_at' => Carbon::now(),
+            ]);
+        });
+    }
+
+    public function cancelRoom(GameRoom $room, Authenticatable $user): void
+    {
+        if ($room->creator_id !== $user->id) {
+            throw ValidationException::withMessages([
+                'room' => ['Apenas o criador pode cancelar a sala.'],
+            ]);
+        }
+
+        DB::transaction(function () use ($room, $user) {
+            $room = GameRoom::query()
+                ->lockForUpdate()
+                ->findOrFail($room->id);
+
+            if (! $room->isWaiting()) {
+                throw ValidationException::withMessages([
+                    'room' => ['Esta sala não pode mais ser cancelada.'],
+                ]);
+            }
+
+            if ($room->bet_amount > 0) {
+                $freshUser = \App\Models\User::query()
+                    ->lockForUpdate()
+                    ->findOrFail($user->id);
+
+                $freshUser->increment('carteira_game', $room->bet_amount);
+            }
+
+            $room->update([
+                'status'      => 'finished',
+                'finished_at' => now(),
             ]);
         });
     }

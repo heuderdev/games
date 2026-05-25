@@ -13,6 +13,7 @@ use Livewire\Component;
 
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
+use Livewire\Attributes\Computed;
 
 class TicTacToe extends Component
 {
@@ -37,8 +38,9 @@ class TicTacToe extends Component
 
     public function render()
     {
-        return view('livewire.games.tic-tac-toe')
-            ->title('Sala - Jogo da Velha');
+        return view('livewire.games.tic-tac-toe', [
+            'existingOpenRoom' => $this->existingOpenRoom,
+        ])->title('Sala - Jogo da Velha');
     }
 
     protected function service(): GameRoomService
@@ -377,5 +379,91 @@ class TicTacToe extends Component
         return $this->room->participants
             ->where('role', 'spectator')
             ->contains('user_id', $userId);
+    }
+
+    #[Computed]
+    public function existingOpenRoom(): ?GameRoom
+    {
+        $userId = Auth::id();
+
+        if (! $userId) {
+            return null;
+        }
+
+        return GameRoom::query()
+            ->where('creator_id', $userId)
+            ->whereIn('status', ['waiting', 'active'])
+            ->latest()
+            ->first();
+    }
+
+    public function enterExistingRoom(): void
+    {
+        $room = $this->existingOpenRoom;
+
+        if (! $room) {
+            $this->errorMessage = 'Sala não encontrada.';
+            return;
+        }
+
+        $this->roomId = $room->id;
+        $this->loadRoom();
+    }
+
+    // Adicione estas duas computed properties junto das outras:
+
+    public function getExistingOpenRoomProperty(): ?GameRoom
+    {
+        $userId = Auth::id();
+
+        if (! $userId) {
+            return null;
+        }
+
+        return GameRoom::query()
+            ->where('creator_id', $userId)
+            ->whereIn('status', ['waiting', 'active'])
+            ->latest()
+            ->first();
+    }
+
+    public function cancelRoom(): void
+    {
+        $this->resetErrorBag();
+        $this->errorMessage = null;
+
+        /** @var Authenticatable|null $user */
+        $user = Auth::user();
+
+        if (! $user) {
+            $this->errorMessage = 'Você precisa estar logado.';
+            return;
+        }
+
+        try {
+            $this->service()->cancelRoom($this->existingOpenRoom, $user);
+        } catch (ValidationException $e) {
+            $this->setErrorFromException($e);
+            return;
+        }
+
+        unset($this->existingOpenRoom);
+        // Não chama loadRoom() — apenas limpa o estado local
+        $this->roomId       = null;
+        $this->room         = null;
+        $this->board        = array_fill(0, 9, null);
+        $this->winnerSymbol = null;
+        $this->isDraw       = false;
+
+        session()->flash('success', 'Sala cancelada com sucesso.');
+    }
+
+    public function refreshRoom(): void
+    {
+        if (! $this->roomId) {
+            return;
+        }
+
+        $this->loadRoom();
     }
 }
